@@ -1,13 +1,15 @@
 """
 Milwaukee Bucks Player Stats Analyzer
 --------------------------------------
-Install:  pip install streamlit nba_api pandas numpy
+Install:  pip install streamlit pandas numpy requests
 Run:      streamlit run app.py
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
+import time
 
 # ── Page config (must be first Streamlit call) ─────────────────────────────────
 st.set_page_config(
@@ -82,28 +84,50 @@ def photo_url(pid):
     return f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
 
 
+# ── NBA API helpers ────────────────────────────────────────────────────────────
+NBA_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.nba.com",
+    "Referer": "https://www.nba.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
+}
+
+def nba_fetch(endpoint, params, result_index=0):
+    url  = f"https://stats.nba.com/stats/{endpoint}"
+    resp = requests.get(url, params=params, headers=NBA_HEADERS, timeout=30)
+    resp.raise_for_status()
+    rs   = resp.json()["resultSets"][result_index]
+    return pd.DataFrame(rs["rowSet"], columns=rs["headers"])
+
+
 # ── Data loading ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
-    from nba_api.stats.endpoints import LeagueDashPlayerStats, CommonTeamRoster
-
-    pool = (
-        LeagueDashPlayerStats(
-            season=SEASON,
-            per_mode_simple="Per100Possessions",
-            season_type_all_star="Regular Season",
-        )
-        .get_data_frames()[0]
-    )
+    pool = nba_fetch("leaguedashplayerstats", {
+        "PerMode":    "Per100Possessions",
+        "Season":     SEASON,
+        "SeasonType": "Regular Season",
+        "LeagueID":   "00",
+    })
     pool["GP"]        = pool["GP"].astype(int)
     pool              = pool[pool["GP"] >= MIN_GP].copy()
     pool["PLAYER_ID"] = pool["PLAYER_ID"].astype(str)
     for col in STAT_COLS:
         pool[col] = pd.to_numeric(pool[col], errors="coerce")
 
-    roster = CommonTeamRoster(
-        team_id=str(BUCKS_ID), season=SEASON
-    ).get_data_frames()[0]
+    time.sleep(0.6)  # be polite between requests
+
+    roster = nba_fetch("commonteamroster", {
+        "TeamID": BUCKS_ID,
+        "Season": SEASON,
+    })
     roster["PLAYER_ID"] = roster["PLAYER_ID"].astype(str)
     return pool, roster
 
