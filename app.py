@@ -90,15 +90,22 @@ def initials(name: str) -> str:
 
 
 # ── balldontlie API helpers ────────────────────────────────────────────────────
-def bdl_get(path, params, api_key):
-    resp = requests.get(
-        f"{BDL_BASE}{path}",
-        headers={"Authorization": api_key},
-        params=params,
-        timeout=25,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def bdl_get(path, params, api_key, max_retries=6):
+    """GET with exponential backoff on 429 rate-limit responses."""
+    for attempt in range(max_retries):
+        resp = requests.get(
+            f"{BDL_BASE}{path}",
+            headers={"Authorization": api_key},
+            params=params,
+            timeout=25,
+        )
+        if resp.status_code == 429:
+            wait = 2 ** attempt          # 1, 2, 4, 8, 16, 32 seconds
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError(f"Rate-limited after {max_retries} retries on {path}")
 
 
 def bdl_paginate(path, params, api_key):
@@ -113,16 +120,35 @@ def bdl_paginate(path, params, api_key):
         cursor = data.get("meta", {}).get("next_cursor")
         if not cursor:
             break
-        time.sleep(0.2)
+        time.sleep(2.5)          # stay well under the 30 req/min free-tier limit
     return items
+
+
+def bdl_season_avgs_batch(batch_ids, api_key, max_retries=6):
+    """Fetch season averages for a list of player IDs with retry on 429."""
+    params = [("season", SEASON_YEAR)] + [("player_ids[]", pid) for pid in batch_ids]
+    for attempt in range(max_retries):
+        resp = requests.get(
+            f"{BDL_BASE}/season_averages",
+            headers={"Authorization": api_key},
+            params=params,
+            timeout=25,
+        )
+        if resp.status_code == 429:
+            time.sleep(2 ** attempt)
+            continue
+        if resp.ok:
+            return resp.json()["data"]
+        break
+    return []
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(api_key: str):
     # 1. Find Milwaukee Bucks team ID
-    teams   = bdl_get("/teams", {"per_page": 30}, api_key)["data"]
-    bucks   = next(t for t in teams if BUCKS_NAME in t["full_name"])
+    teams    = bdl_get("/teams", {"per_page": 30}, api_key)["data"]
+    bucks    = next(t for t in teams if BUCKS_NAME in t["full_name"])
     bucks_id = bucks["id"]
 
     # 2. Bucks roster
@@ -133,20 +159,12 @@ def load_data(api_key: str):
     all_players = bdl_paginate("/players", {}, api_key)
     all_ids     = [str(p["id"]) for p in all_players]
 
-    # 4. Season averages — fetch in batches of 50 to stay within URL limits
+    # 4. Season averages — larger batches (100) = fewer requests = fewer 429s
     all_avgs = []
-    for i in range(0, len(all_ids), 50):
-        batch  = all_ids[i : i + 50]
-        params = [("season", SEASON_YEAR)] + [("player_ids[]", pid) for pid in batch]
-        resp   = requests.get(
-            f"{BDL_BASE}/season_averages",
-            headers={"Authorization": api_key},
-            params=params,
-            timeout=25,
-        )
-        if resp.ok:
-            all_avgs.extend(resp.json()["data"])
-        time.sleep(0.25)
+    for i in range(0, len(all_ids), 100):
+        batch     = all_ids[i : i + 100]
+        all_avgs += bdl_season_avgs_batch(batch, api_key)
+        time.sleep(2.5)          # ~24 req/min — safely under the 30/min cap
 
     if not all_avgs:
         raise RuntimeError("No season averages returned from balldontlie")
