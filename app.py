@@ -22,8 +22,7 @@ BUCKS_ESPN_ID  = "15"
 SEASON         = "2025"   # ESPN uses end year: 2024-25 → 2025
 MIN_GP         = 10
 
-ESPN_STATS_URL  = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete"
-ESPN_ROSTER_URL = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{BUCKS_ESPN_ID}/roster"
+ESPN_STATS_URL = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete"
 
 ESPN_HDRS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -133,12 +132,7 @@ def load_data():
     s.raise_for_status()
     sdata = s.json()
 
-    # ── 2. Bucks roster (single request) ──────────────────────────────────────
-    r = requests.get(ESPN_ROSTER_URL, headers=ESPN_HDRS, timeout=20)
-    r.raise_for_status()
-    rdata = r.json()
-
-    # ── 3. Build flat header list from top-level categories ───────────────────
+    # ── 2. Build flat header list from top-level categories ───────────────────
     # ESPN uses a parallel-array format: statistics[] lines up with the
     # flattened list of stats across all categories
     flat_headers = []
@@ -146,7 +140,7 @@ def load_data():
         for stat in cat.get("stats", []):
             flat_headers.append(stat.get("name", ""))
 
-    # ── 4. Parse each athlete entry ────────────────────────────────────────────
+    # ── 3. Parse each athlete entry ────────────────────────────────────────────
     records = []
     for entry in sdata.get("athletes", []):
         ath   = entry.get("athlete", {})
@@ -186,7 +180,7 @@ def load_data():
     if pool.empty:
         raise RuntimeError("ESPN stats endpoint returned no athlete data")
 
-    # ── 5. Map ESPN stat names → internal keys ─────────────────────────────────
+    # ── 4. Map ESPN stat names → internal keys ─────────────────────────────────
     available = set(pool.columns)
     for key, candidates in STAT_CANDIDATES.items():
         src = next((c for c in candidates if c in available), None)
@@ -199,19 +193,15 @@ def load_data():
     for col in STAT_COLS:
         pool[f"{col}_p36"] = (pool[col] / pool["min"].replace(0, np.nan) * 36).round(1)
 
-    # ── 6. Parse Bucks roster ──────────────────────────────────────────────────
-    bucks_raw = []
-    for item in rdata.get("athletes", []):
-        # ESPN groups roster by position group; each group has an "items" list
-        if "items" in item:
-            bucks_raw.extend(item["items"])
-        else:
-            bucks_raw.append(item)
-
-    bucks_ids  = {str(p.get("id", "")) for p in bucks_raw}
+    # ── 5. Bucks subset — filter by team_id already present in stats data ──────
+    # The stats response includes team_id per player; no separate roster call needed.
     bucks_pool = (
-        pool[pool["espn_id"].isin(bucks_ids)]
+        pool[pool["team_id"] == BUCKS_ESPN_ID]
         .sort_values("name")
+        .reset_index(drop=True)
+    )
+
+    return pool, bucks_pool
         .reset_index(drop=True)
     )
 
