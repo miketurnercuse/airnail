@@ -125,6 +125,7 @@ def load_data():
         ESPN_STATS_URL,
         params={
             "region": "us", "lang": "en", "contentorigin": "espn",
+            "isqualified": "true",
             "limit": "500", "season": SEASON, "seasontype": "2",
         },
         headers=ESPN_HDRS,
@@ -133,9 +134,14 @@ def load_data():
     s.raise_for_status()
     sdata = s.json()
 
+    athletes_raw = sdata.get("athletes", [])
+    if not athletes_raw:
+        raise RuntimeError(
+            f"ESPN returned no athletes. Top-level keys: {list(sdata.keys())}. "
+            f"Sample response: {str(sdata)[:500]}"
+        )
+
     # ── 2. Build flat header list from top-level categories ───────────────────
-    # ESPN uses a parallel-array format: statistics[] lines up with the
-    # flattened list of stats across all categories
     flat_headers = []
     for cat in sdata.get("categories", []):
         for stat in cat.get("stats", []):
@@ -143,7 +149,7 @@ def load_data():
 
     # ── 3. Parse each athlete entry ────────────────────────────────────────────
     records = []
-    for entry in sdata.get("athletes", []):
+    for entry in athletes_raw:
         ath   = entry.get("athlete", {})
         stats = entry.get("statistics", [])
 
@@ -188,7 +194,13 @@ def load_data():
 
     pool = pd.DataFrame(records)
     if pool.empty:
-        raise RuntimeError("ESPN stats endpoint returned no athlete data")
+        sample_entry = athletes_raw[0] if athletes_raw else {}
+        raise RuntimeError(
+            f"Parsed 0 records from {len(athletes_raw)} athletes. "
+            f"flat_headers (first 10): {flat_headers[:10]}. "
+            f"Sample entry keys: {list(sample_entry.keys())}. "
+            f"Sample athlete keys: {list(sample_entry.get('athlete', {}).keys()[:10])}."
+        )
 
     # ── 4. Map ESPN stat names → internal keys ─────────────────────────────────
     available = set(pool.columns)
@@ -196,27 +208,30 @@ def load_data():
         src = next((c for c in candidates if c in available), None)
         pool[key] = pd.to_numeric(pool[src], errors="coerce") if src else np.nan
 
-    pool["gp"]  = pool["gp"].fillna(0).astype(int)
     pool["min"] = pd.to_numeric(pool["min"], errors="coerce")
-    pool        = pool[pool["gp"] >= MIN_GP].copy()
+    pool["gp"]  = pool["gp"].fillna(0).astype(int)
+
+    # Filter only players with recorded minutes (don't filter on gp —
+    # ESPN's isqualified param already gates meaningful records)
+    pool = pool[pool["min"].notna() & (pool["min"] > 0)].copy()
 
     for col in STAT_COLS:
         pool[f"{col}_p36"] = (pool[col] / pool["min"].replace(0, np.nan) * 36).round(1)
 
-    # ── 5. Bucks subset — filter by team_id already present in stats data ──────
+    # ── 5. Bucks subset ────────────────────────────────────────────────────────
     bucks_pool = (
         pool[pool["team_id"] == BUCKS_ESPN_ID]
         .sort_values("name")
         .reset_index(drop=True)
     )
 
-    # Debug: surface what team_ids actually came back so we can diagnose mismatches
     if bucks_pool.empty:
-        sample = pool["team_id"].value_counts().head(10).to_dict()
+        sample_tids   = pool["team_id"].value_counts().head(10).to_dict()
+        mapped_stats  = [k for k in STAT_CANDIDATES if pool[k].notna().any()]
         raise RuntimeError(
-            f"No Bucks players found (looking for team_id='{BUCKS_ESPN_ID}'). "
-            f"Sample team_ids in pool: {sample}. "
-            f"Total players in pool: {len(pool)}."
+            f"No Bucks players (team_id='{BUCKS_ESPN_ID}') in pool of {len(pool)}. "
+            f"Mapped stats: {mapped_stats}. "
+            f"Sample team_ids: {sample_tids}."
         )
 
     return pool, bucks_pool
