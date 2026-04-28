@@ -202,10 +202,6 @@ def load_data():
     )
 
     return pool, bucks_pool
-        .reset_index(drop=True)
-    )
-
-    return pool, bucks_pool
 
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
