@@ -192,15 +192,21 @@ def load_data():
             **stat_dict,
         })
 
-    pool = pd.DataFrame(records)
-    if pool.empty:
+    if not records:
         sample_entry = athletes_raw[0] if athletes_raw else {}
+        sample_stats = sample_entry.get("statistics", "MISSING")
         raise RuntimeError(
             f"Parsed 0 records from {len(athletes_raw)} athletes. "
             f"flat_headers (first 10): {flat_headers[:10]}. "
-            f"Sample entry keys: {list(sample_entry.keys())}. "
-            f"Sample athlete keys: {list(sample_entry.get('athlete', {}).keys()[:10])}."
+            f"First entry keys: {list(sample_entry.keys())}. "
+            f"First entry 'statistics' type/value: {type(sample_stats).__name__} = {str(sample_stats)[:300]}."
         )
+
+    pool = pd.DataFrame(records)
+
+    # Capture stat column names BEFORE any mapping so we can debug mismatches
+    raw_stat_cols = [c for c in pool.columns
+                     if c not in {"espn_id","name","jersey","position","team_id","headshot"}]
 
     # ── 4. Map ESPN stat names → internal keys ─────────────────────────────────
     available = set(pool.columns)
@@ -210,10 +216,7 @@ def load_data():
 
     pool["min"] = pd.to_numeric(pool["min"], errors="coerce")
     pool["gp"]  = pool["gp"].fillna(0).astype(int)
-
-    # Filter only players with recorded minutes (don't filter on gp —
-    # ESPN's isqualified param already gates meaningful records)
-    pool = pool[pool["min"].notna() & (pool["min"] > 0)].copy()
+    pool        = pool[pool["min"].notna() & (pool["min"] > 0)].copy()
 
     for col in STAT_COLS:
         pool[f"{col}_p36"] = (pool[col] / pool["min"].replace(0, np.nan) * 36).round(1)
@@ -226,12 +229,14 @@ def load_data():
     )
 
     if bucks_pool.empty:
-        sample_tids   = pool["team_id"].value_counts().head(10).to_dict()
-        mapped_stats  = [k for k in STAT_CANDIDATES if pool[k].notna().any()]
+        mapped  = [k for k in STAT_CANDIDATES if pool[k].notna().any()]
+        tids    = pool["team_id"].value_counts().head(10).to_dict()
         raise RuntimeError(
-            f"No Bucks players (team_id='{BUCKS_ESPN_ID}') in pool of {len(pool)}. "
-            f"Mapped stats: {mapped_stats}. "
-            f"Sample team_ids: {sample_tids}."
+            f"Pool has {len(pool)} players but none with team_id='{BUCKS_ESPN_ID}'. "
+            f"Sample team_ids: {tids}. "
+            f"Mapped stats: {mapped}. "
+            f"Raw ESPN stat columns (first 20): {raw_stat_cols[:20]}. "
+            f"flat_headers (first 20): {flat_headers[:20]}."
         )
 
     return pool, bucks_pool
