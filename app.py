@@ -9,6 +9,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import re
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -166,12 +167,21 @@ def load_data():
             else f"https://a.espncdn.com/i/headshots/nba/players/full/{espn_id}.png"
         )
 
+        # ESPN sometimes returns team as a $ref URL instead of an object with id.
+        # e.g. {"$ref": "http://sports.core.api.espn.com/.../teams/15?..."}
+        team_obj = ath.get("team", {})
+        if isinstance(team_obj, dict) and "$ref" in team_obj:
+            m = re.search(r"/teams/(\d+)", team_obj["$ref"])
+            team_id = m.group(1) if m else ""
+        else:
+            team_id = str(team_obj.get("id", "")) if isinstance(team_obj, dict) else ""
+
         records.append({
             "espn_id":  espn_id,
             "name":     ath.get("displayName", ""),
             "jersey":   ath.get("jersey", ""),
             "position": ath.get("position", {}).get("abbreviation", ""),
-            "team_id":  str(ath.get("team", {}).get("id", "")),
+            "team_id":  team_id,
             "headshot": hs_url,
             **stat_dict,
         })
@@ -194,12 +204,20 @@ def load_data():
         pool[f"{col}_p36"] = (pool[col] / pool["min"].replace(0, np.nan) * 36).round(1)
 
     # ── 5. Bucks subset — filter by team_id already present in stats data ──────
-    # The stats response includes team_id per player; no separate roster call needed.
     bucks_pool = (
         pool[pool["team_id"] == BUCKS_ESPN_ID]
         .sort_values("name")
         .reset_index(drop=True)
     )
+
+    # Debug: surface what team_ids actually came back so we can diagnose mismatches
+    if bucks_pool.empty:
+        sample = pool["team_id"].value_counts().head(10).to_dict()
+        raise RuntimeError(
+            f"No Bucks players found (looking for team_id='{BUCKS_ESPN_ID}'). "
+            f"Sample team_ids in pool: {sample}. "
+            f"Total players in pool: {len(pool)}."
+        )
 
     return pool, bucks_pool
 
