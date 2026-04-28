@@ -3,17 +3,12 @@ Milwaukee Bucks Player Stats Analyzer
 --------------------------------------
 Install:  pip install streamlit pandas numpy requests
 Run:      streamlit run app.py
-
-Streamlit Cloud: add your free balldontlie key under Settings → Secrets:
-  BALLDONTLIE_KEY = "your_key_here"
-Get a free key at https://www.balldontlie.io/
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import time
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -23,23 +18,49 @@ st.set_page_config(
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-BUCKS_NAME  = "Milwaukee Bucks"
-SEASON_YEAR = 2024          # balldontlie uses the start year: 2024-25 → 2024
-MIN_GP      = 10
-BDL_BASE    = "https://api.balldontlie.io/v1"
+BUCKS_ESPN_ID  = "15"
+SEASON         = "2025"   # ESPN uses end year: 2024-25 → 2025
+MIN_GP         = 10
 
-# balldontlie field names map to what we display
+ESPN_STATS_URL  = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete"
+ESPN_ROSTER_URL = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{BUCKS_ESPN_ID}/roster"
+
+ESPN_HDRS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://www.espn.com/nba/stats/",
+    "Origin":          "https://www.espn.com",
+}
+
+# Multiple candidate ESPN stat names for each internal key (API uses different
+# names depending on the category context returned)
+STAT_CANDIDATES = {
+    "pts":  ["avgPoints"],
+    "reb":  ["avgRebounds", "avgTotalRebounds"],
+    "ast":  ["avgAssists"],
+    "tov":  ["avgTurnovers"],
+    "stl":  ["avgSteals"],
+    "blk":  ["avgBlocksPerGame", "avgBlocks"],
+    "oreb": ["avgOffensiveRebounds"],
+    "fga":  ["avgFieldGoalAttempts"],
+    "fg3a": ["avgThreePointFieldGoalAttempts", "avgThreePointerAttempts"],
+    "fta":  ["avgFreeThrowAttempts"],
+    "min":  ["avgMinutes"],
+    "gp":   ["gamesPlayed"],
+}
+
 STATS = [
-    ("pts",      "Points"),
-    ("reb",      "Rebounds"),
-    ("ast",      "Assists"),
-    ("turnover", "Turnovers"),
-    ("stl",      "Steals"),
-    ("blk",      "Blocks"),
-    ("oreb",     "Off. Rebounds"),
-    ("fga",      "FG Attempted"),
-    ("fg3a",     "3P Attempted"),
-    ("fta",      "FT Attempted"),
+    ("pts",  "Points"),
+    ("reb",  "Rebounds"),
+    ("ast",  "Assists"),
+    ("tov",  "Turnovers"),
+    ("stl",  "Steals"),
+    ("blk",  "Blocks"),
+    ("oreb", "Off. Rebounds"),
+    ("fga",  "FG Attempted"),
+    ("fg3a", "3P Attempted"),
+    ("fta",  "FT Attempted"),
 ]
 STAT_COLS = [s[0] for s in STATS]
 
@@ -89,117 +110,111 @@ def initials(name: str) -> str:
     return "".join(p[0].upper() for p in parts if p)[:2]
 
 
-# ── balldontlie API helpers ────────────────────────────────────────────────────
-def bdl_get(path, params, api_key, max_retries=6):
-    """GET with exponential backoff on 429 rate-limit responses."""
-    for attempt in range(max_retries):
-        resp = requests.get(
-            f"{BDL_BASE}{path}",
-            headers={"Authorization": api_key},
-            params=params,
-            timeout=25,
-        )
-        if resp.status_code == 429:
-            wait = 2 ** attempt          # 1, 2, 4, 8, 16, 32 seconds
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp.json()
-    raise RuntimeError(f"Rate-limited after {max_retries} retries on {path}")
-
-
-def bdl_paginate(path, params, api_key):
-    """Collect every page from a cursor-paginated endpoint."""
-    items, cursor = [], None
-    while True:
-        p = {"per_page": 100, **params}
-        if cursor:
-            p["cursor"] = cursor
-        data = bdl_get(path, p, api_key)
-        items.extend(data["data"])
-        cursor = data.get("meta", {}).get("next_cursor")
-        if not cursor:
-            break
-        time.sleep(2.5)          # stay well under the 30 req/min free-tier limit
-    return items
-
-
-def bdl_season_avgs_batch(batch_ids, api_key, max_retries=6):
-    """Fetch season averages for a list of player IDs with retry on 429."""
-    params = [("season", SEASON_YEAR)] + [("player_ids[]", pid) for pid in batch_ids]
-    for attempt in range(max_retries):
-        resp = requests.get(
-            f"{BDL_BASE}/season_averages",
-            headers={"Authorization": api_key},
-            params=params,
-            timeout=25,
-        )
-        if resp.status_code == 429:
-            time.sleep(2 ** attempt)
-            continue
-        if resp.ok:
-            return resp.json()["data"]
-        break
-    return []
+def safe_float(val):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return np.nan
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_data(api_key: str):
-    # 1. Find Milwaukee Bucks team ID
-    teams    = bdl_get("/teams", {"per_page": 30}, api_key)["data"]
-    bucks    = next(t for t in teams if BUCKS_NAME in t["full_name"])
-    bucks_id = bucks["id"]
+def load_data():
+    # ── 1. All NBA player stats (single request) ───────────────────────────────
+    s = requests.get(
+        ESPN_STATS_URL,
+        params={
+            "region": "us", "lang": "en", "contentorigin": "espn",
+            "limit": "500", "season": SEASON, "seasontype": "2",
+        },
+        headers=ESPN_HDRS,
+        timeout=20,
+    )
+    s.raise_for_status()
+    sdata = s.json()
 
-    # 2. Bucks roster
-    bucks_players = bdl_paginate("/players", {"team_ids[]": bucks_id}, api_key)
-    bucks_ids     = {str(p["id"]) for p in bucks_players}
+    # ── 2. Bucks roster (single request) ──────────────────────────────────────
+    r = requests.get(ESPN_ROSTER_URL, headers=ESPN_HDRS, timeout=20)
+    r.raise_for_status()
+    rdata = r.json()
 
-    # 3. All NBA players (needed for league-wide percentile pool)
-    all_players = bdl_paginate("/players", {}, api_key)
-    all_ids     = [str(p["id"]) for p in all_players]
+    # ── 3. Build flat header list from top-level categories ───────────────────
+    # ESPN uses a parallel-array format: statistics[] lines up with the
+    # flattened list of stats across all categories
+    flat_headers = []
+    for cat in sdata.get("categories", []):
+        for stat in cat.get("stats", []):
+            flat_headers.append(stat.get("name", ""))
 
-    # 4. Season averages — larger batches (100) = fewer requests = fewer 429s
-    all_avgs = []
-    for i in range(0, len(all_ids), 100):
-        batch     = all_ids[i : i + 100]
-        all_avgs += bdl_season_avgs_batch(batch, api_key)
-        time.sleep(2.5)          # ~24 req/min — safely under the 30/min cap
+    # ── 4. Parse each athlete entry ────────────────────────────────────────────
+    records = []
+    for entry in sdata.get("athletes", []):
+        ath   = entry.get("athlete", {})
+        stats = entry.get("statistics", [])
 
-    if not all_avgs:
-        raise RuntimeError("No season averages returned from balldontlie")
+        stat_dict = {}
+        if isinstance(stats, list) and flat_headers:
+            # Flat parallel array (most common ESPN format)
+            for i, val in enumerate(stats):
+                if i < len(flat_headers) and flat_headers[i]:
+                    stat_dict[flat_headers[i]] = safe_float(val)
+        elif isinstance(stats, dict):
+            # Nested splits.categories format (fallback)
+            for cat in stats.get("splits", {}).get("categories", []):
+                for st in cat.get("stats", []):
+                    stat_dict[st["name"]] = safe_float(st.get("value"))
 
-    # 5. Build pool DataFrame
-    pool = pd.DataFrame(all_avgs)
-    pool["player_id"]    = pool["player_id"].astype(str)
-    pool["min"]          = pd.to_numeric(pool["min"],          errors="coerce")
-    pool["games_played"] = pd.to_numeric(pool["games_played"], errors="coerce").fillna(0).astype(int)
+        espn_id  = str(ath.get("id", ""))
+        headshot = ath.get("headshot", {})
+        hs_url   = (
+            headshot.get("href")
+            if isinstance(headshot, dict)
+            else f"https://a.espncdn.com/i/headshots/nba/players/full/{espn_id}.png"
+        )
+
+        records.append({
+            "espn_id":  espn_id,
+            "name":     ath.get("displayName", ""),
+            "jersey":   ath.get("jersey", ""),
+            "position": ath.get("position", {}).get("abbreviation", ""),
+            "team_id":  str(ath.get("team", {}).get("id", "")),
+            "headshot": hs_url,
+            **stat_dict,
+        })
+
+    pool = pd.DataFrame(records)
+    if pool.empty:
+        raise RuntimeError("ESPN stats endpoint returned no athlete data")
+
+    # ── 5. Map ESPN stat names → internal keys ─────────────────────────────────
+    available = set(pool.columns)
+    for key, candidates in STAT_CANDIDATES.items():
+        src = next((c for c in candidates if c in available), None)
+        pool[key] = pd.to_numeric(pool[src], errors="coerce") if src else np.nan
+
+    pool["gp"]  = pool["gp"].fillna(0).astype(int)
+    pool["min"] = pd.to_numeric(pool["min"], errors="coerce")
+    pool        = pool[pool["gp"] >= MIN_GP].copy()
 
     for col in STAT_COLS:
-        if col not in pool.columns:
-            pool[col] = np.nan
-        pool[col] = pd.to_numeric(pool[col], errors="coerce")
-        # Per-36 min ≈ per-75 possessions at NBA average pace (~100 poss / 48 min)
         pool[f"{col}_p36"] = (pool[col] / pool["min"].replace(0, np.nan) * 36).round(1)
 
-    pool = pool[pool["games_played"] >= MIN_GP].copy()
+    # ── 6. Parse Bucks roster ──────────────────────────────────────────────────
+    bucks_raw = []
+    for item in rdata.get("athletes", []):
+        # ESPN groups roster by position group; each group has an "items" list
+        if "items" in item:
+            bucks_raw.extend(item["items"])
+        else:
+            bucks_raw.append(item)
 
-    # 6. Merge player info (name, position, jersey number)
-    pinfo = pd.DataFrame(all_players)
-    pinfo["id"] = pinfo["id"].astype(str)
-    keep  = ["id", "first_name", "last_name", "position"]
-    if "jersey_number" in pinfo.columns:
-        keep.append("jersey_number")
-
-    pool = pool.merge(
-        pinfo[keep].rename(columns={"id": "player_id"}),
-        on="player_id", how="left",
+    bucks_ids  = {str(p.get("id", "")) for p in bucks_raw}
+    bucks_pool = (
+        pool[pool["espn_id"].isin(bucks_ids)]
+        .sort_values("name")
+        .reset_index(drop=True)
     )
-    pool["full_name"] = (
-        pool["first_name"].fillna("") + " " + pool["last_name"].fillna("")
-    ).str.strip()
 
-    bucks_pool = pool[pool["player_id"].isin(bucks_ids)].sort_values("full_name")
     return pool, bucks_pool
 
 
@@ -224,9 +239,7 @@ html, body, [data-testid="stAppViewContainer"],
 .block-container,
 [data-testid="stAppViewBlockContainer"],
 div[data-testid="stVerticalBlock"] {
-    padding: 0 !important;
-    gap: 0 !important;
-    max-width: 100% !important;
+    padding: 0 !important; gap: 0 !important; max-width: 100% !important;
 }
 
 [data-testid="stColumns"] {
@@ -238,43 +251,26 @@ div[data-testid="stVerticalBlock"] {
 
 [data-testid="column"] { padding: 0 !important; gap: 0 !important; }
 
-/* Selectbox */
 [data-testid="stSelectbox"] label {
-    font-size: 0.7rem !important;
-    text-transform: uppercase !important;
-    letter-spacing: 1.2px !important;
-    color: #6b7280 !important;
-    font-weight: 700 !important;
+    font-size: 0.7rem !important; text-transform: uppercase !important;
+    letter-spacing: 1.2px !important; color: #6b7280 !important; font-weight: 700 !important;
 }
-
 [data-testid="stSelectbox"] [data-baseweb="select"] {
-    background-color: #1a2234 !important;
-    border: 1px solid #2d3748 !important;
-    border-radius: 8px !important;
+    background-color: #1a2234 !important; border: 1px solid #2d3748 !important; border-radius: 8px !important;
 }
-
 [data-testid="stSelectbox"] [data-baseweb="select"]:focus-within {
-    border-color: #00893B !important;
-    box-shadow: 0 0 0 3px rgba(0,137,59,0.2) !important;
+    border-color: #00893B !important; box-shadow: 0 0 0 3px rgba(0,137,59,0.2) !important;
 }
-
 [data-testid="stSelectbox"] [data-baseweb="select"] * {
-    color: #e6edf3 !important;
-    background-color: #1a2234 !important;
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 600 !important;
-    font-size: 0.95rem !important;
+    color: #e6edf3 !important; background-color: #1a2234 !important;
+    font-family: 'Inter', sans-serif !important; font-weight: 600 !important; font-size: 0.95rem !important;
 }
 
 /* ── Header ── */
 .app-header {
     background: linear-gradient(135deg, #003D17 0%, #00471B 40%, #00893B 100%);
-    padding: 20px 36px;
-    display: flex;
-    align-items: center;
-    gap: 20px;
-    border-bottom: 3px solid #EEE1C6;
-    box-shadow: 0 6px 30px rgba(0,0,0,0.6);
+    padding: 20px 36px; display: flex; align-items: center; gap: 20px;
+    border-bottom: 3px solid #EEE1C6; box-shadow: 0 6px 30px rgba(0,0,0,0.6);
 }
 .app-header img { height: 58px; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.4)); }
 .app-header h1  { font-size: 1.85rem; font-weight: 900; letter-spacing: -0.5px; color: #fff; margin: 0; }
@@ -285,38 +281,38 @@ div[data-testid="stVerticalBlock"] {
 
 /* ── Player card ── */
 .player-card {
-    background: #111827;
-    border: 1px solid #1a2234;
-    border-radius: 16px;
-    overflow: hidden;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+    background: #111827; border: 1px solid #1a2234;
+    border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+}
+
+.player-photo-bg {
+    background: radial-gradient(ellipse at top, #1a2d3a 0%, #111827 70%);
+    padding: 24px 20px 0; text-align: center; position: relative;
+}
+.player-photo-bg::after {
+    content: ''; position: absolute; bottom: 0; left: 0; right: 0;
+    height: 30px; background: linear-gradient(transparent, #111827);
+}
+.player-photo-bg img {
+    width: 200px; height: 150px; object-fit: contain; object-position: top center;
+    display: block; margin: 0 auto; position: relative; z-index: 1;
 }
 
 .player-avatar {
     background: linear-gradient(135deg, #003D17 0%, #00471B 50%, #005C24 100%);
-    height: 160px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    height: 160px; display: flex; align-items: center; justify-content: center;
     border-bottom: 1px solid rgba(238,225,198,0.15);
 }
-
 .player-initials {
-    font-size: 4.5rem;
-    font-weight: 900;
-    color: rgba(255,255,255,0.75);
-    letter-spacing: -3px;
-    text-shadow: 0 3px 12px rgba(0,0,0,0.4);
-    font-family: 'Inter', sans-serif;
+    font-size: 4.5rem; font-weight: 900; color: rgba(255,255,255,0.75);
+    letter-spacing: -3px; text-shadow: 0 3px 12px rgba(0,0,0,0.4);
 }
 
 .player-details { padding: 18px 20px 24px; }
 .player-full-name { font-size: 1.1rem; font-weight: 800; color: #fff; line-height: 1.25; margin-bottom: 12px; }
-
 .player-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
 .chip { background: #1a2234; border: 1px solid #2d3748; border-radius: 6px; padding: 5px 11px; font-size: 0.78rem; color: #9ca3af; }
 .chip strong { color: #e6edf3; font-weight: 700; }
-
 .detail-block { margin-bottom: 14px; }
 .detail-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 1.2px; color: #4b5563; font-weight: 700; margin-bottom: 2px; }
 .detail-value { font-size: 1rem; font-weight: 700; color: #e6edf3; }
@@ -325,48 +321,34 @@ div[data-testid="stVerticalBlock"] {
 
 /* ── Stats panel ── */
 .stats-panel {
-    background: #111827;
-    border: 1px solid #1a2234;
-    border-radius: 16px;
-    overflow: hidden;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+    background: #111827; border: 1px solid #1a2234;
+    border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.4);
 }
-
 .stats-panel-hdr {
-    padding: 22px 28px 18px;
-    border-bottom: 1px solid #1a2234;
+    padding: 22px 28px 18px; border-bottom: 1px solid #1a2234;
     background: linear-gradient(180deg, #141f2e 0%, #111827 100%);
 }
 .stats-panel-hdr h2 { font-size: 1.05rem; font-weight: 800; color: #fff; margin: 0; }
 .stats-panel-hdr p  { font-size: 0.73rem; color: #6b7280; margin: 4px 0 0; }
 
 .col-headers {
-    display: grid;
-    grid-template-columns: 155px 90px 1fr 90px;
-    padding: 10px 28px;
-    background: #0f1623;
-    border-bottom: 1px solid #1a2234;
-    gap: 12px;
+    display: grid; grid-template-columns: 155px 90px 1fr 90px;
+    padding: 10px 28px; background: #0f1623; border-bottom: 1px solid #1a2234; gap: 12px;
 }
 .chdr { font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1.1px; color: #4b5563; }
 .chdr.c { text-align: center; }
 .chdr.r { text-align: right; }
 
 .stat-row {
-    display: grid;
-    grid-template-columns: 155px 90px 1fr 90px;
-    align-items: center;
-    padding: 15px 28px;
-    border-bottom: 1px solid #131c2b;
-    gap: 12px;
-    transition: background 0.12s;
+    display: grid; grid-template-columns: 155px 90px 1fr 90px;
+    align-items: center; padding: 15px 28px; border-bottom: 1px solid #131c2b;
+    gap: 12px; transition: background 0.12s;
 }
 .stat-row:last-child { border-bottom: none; }
 .stat-row:hover      { background: #141f2e; }
 
 .stat-name { font-size: 0.88rem; font-weight: 600; color: #d1d5db; }
 .stat-val  { font-size: 1.35rem; font-weight: 800; color: #fff; text-align: center; letter-spacing: -0.5px; }
-
 .pct-bar-wrap { display: flex; align-items: center; }
 .pct-track { flex: 1; height: 8px; background: #1a2234; border-radius: 4px; overflow: hidden; }
 .pct-fill  { height: 100%; border-radius: 4px; }
@@ -390,22 +372,10 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── API key ─────────────────────────────────────────────────────────────────────
-try:
-    api_key = st.secrets["BALLDONTLIE_KEY"]
-except KeyError:
-    st.error(
-        "**API key not found.** "
-        "Go to your Streamlit Cloud app → Settings → Secrets and add:\n\n"
-        "```\nBALLDONTLIE_KEY = \"your_key_here\"\n```\n\n"
-        "Get a free key at https://www.balldontlie.io/"
-    )
-    st.stop()
-
 # ── Load data ──────────────────────────────────────────────────────────────────
 with st.spinner("Loading 2024-25 NBA data..."):
     try:
-        nba_pool, bucks_pool = load_data(api_key)
+        nba_pool, bucks_pool = load_data()
         data_ok = True
     except Exception as exc:
         st.error(f"Failed to load NBA data: {exc}")
@@ -415,34 +385,45 @@ with st.spinner("Loading 2024-25 NBA data..."):
 # ── Player selector ────────────────────────────────────────────────────────────
 st.markdown('<div class="selector-bar">', unsafe_allow_html=True)
 
-player_names = bucks_pool["full_name"].tolist() if data_ok and not bucks_pool.empty else []
+player_names = bucks_pool["name"].tolist() if data_ok and not bucks_pool.empty else []
 selected     = st.selectbox("Player", options=player_names,
                             index=0 if player_names else None)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ── Resolve selected row ────────────────────────────────────────────────────────
+# ── Resolve selected player ────────────────────────────────────────────────────
 if selected and data_ok:
-    row = bucks_pool[bucks_pool["full_name"] == selected].iloc[0]
+    row = bucks_pool[bucks_pool["name"] == selected].iloc[0]
 else:
     row = None
 
 
 # ── Build player card ──────────────────────────────────────────────────────────
 def build_player_card(r):
-    name = r["full_name"]
-    num  = r.get("jersey_number", None)
-    num  = f"#{num}" if pd.notna(num) and str(num).strip() else "—"
-    pos  = r.get("position", "—")
-    pos  = pos if pd.notna(pos) and str(pos).strip() else "—"
-    gp   = int(r["games_played"]) if pd.notna(r["games_played"]) else "—"
-    inits = initials(name)
+    name     = r["name"]
+    num      = str(r.get("jersey", "")).strip()
+    num      = f"#{num}" if num else "—"
+    pos      = str(r.get("position", "")).strip() or "—"
+    gp       = int(r["gp"]) if pd.notna(r["gp"]) else "—"
+    hs_url   = r.get("headshot", "")
+    inits    = initials(name)
+
+    # Show ESPN headshot; fall back to initials avatar on load error
+    if hs_url:
+        photo = f"""
+  <div class="player-photo-bg">
+    <img src="{hs_url}" alt="{name}"
+         onerror="this.parentElement.outerHTML='<div class=player-avatar><span class=player-initials>{inits}</span></div>'">
+  </div>"""
+    else:
+        photo = f"""
+  <div class="player-avatar">
+    <span class="player-initials">{inits}</span>
+  </div>"""
 
     return f"""
 <div class="player-card">
-  <div class="player-avatar">
-    <span class="player-initials">{inits}</span>
-  </div>
+  {photo}
   <div class="player-details">
     <div class="player-full-name">{name}</div>
     <div class="player-chips">
@@ -512,6 +493,6 @@ if row is not None:
     with right:
         st.markdown(build_stats_panel(row), unsafe_allow_html=True)
 elif not data_ok:
-    st.warning("Could not load NBA data. Check your API key and try again.")
+    st.warning("Could not load NBA data. Check your internet connection and try again.")
 else:
     st.info("Select a player from the dropdown above.")
