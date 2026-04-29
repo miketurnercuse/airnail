@@ -118,105 +118,158 @@ def safe_float(val):
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data():
-    # ── 1. All NBA player stats (single request) ───────────────────────────────
-    s = requests.get(
+def _extract_stats(entry, flat_headers):
+    """Pull stat name→value dict from an ESPN athlete entry using all known formats."""
+    ath   = entry.get("athlete", {}) if isinstance(entry.get("athlete"), dict) else {}
+    # ESPN puts statistics under several possible keys depending on endpoint/version
+    raw   = (entry.get("statistics")
+             or entry.get("stats")
+             or entry.get("splits")
+             or ath.get("statistics")
+             or ath.get("stats")
+             or [])
+
+    stat_dict = {}
+
+    if isinstance(raw, list):
+        if flat_headers and raw and not isinstance(raw[0], dict):
+            # Parallel-array format: raw[i] corresponds to flat_headers[i]
+            for i, val in enumerate(raw):
+                if i < len(flat_headers) and flat_headers[i]:
+                    stat_dict[flat_headers[i]] = safe_float(val)
+        else:
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                if "name" in item and ("value" in item or "displayValue" in item):
+                    # Direct stat object: {"name": "avgPoints", "value": 30.4}
+                    name = item["name"]
+                    val  = item.get("value") if item.get("value") is not None else item.get("displayValue")
+                    stat_dict[name] = safe_float(val)
+                else:
+                    # Category object: {"name": "offensive", "stats": [...]}
+                    for st in item.get("stats", []):
+                        name = st.get("name", "")
+                        val  = st.get("value") if st.get("value") is not None else st.get("displayValue")
+                        if name:
+                            stat_dict[name] = safe_float(val)
+
+    elif isinstance(raw, dict) and "$ref" not in raw:
+        # Nested splits.categories format
+        for cat in raw.get("splits", {}).get("categories", []):
+            for st in cat.get("stats", []):
+                stat_dict[st["name"]] = safe_float(st.get("value"))
+
+    return stat_dict
+
+
+def _extract_team_id(ath):
+    team_obj = ath.get("team", {}) if isinstance(ath, dict) else {}
+    if isinstance(team_obj, dict):
+        if "$ref" in team_obj:
+            m = re.search(r"/teams/(\d+)", team_obj["$ref"])
+            return m.group(1) if m else ""
+        return str(team_obj.get("id", ""))
+    return ""
+
+
+def _fetch_espn(category, sort_col, limit=500):
+    r = requests.get(
         ESPN_STATS_URL,
         params={
             "region": "us", "lang": "en", "contentorigin": "espn",
             "isqualified": "true",
-            "limit": "500", "season": SEASON, "seasontype": "2",
+            "limit": str(limit), "season": SEASON, "seasontype": "2",
+            "category": category,
+            "sort": f"{sort_col}:desc",
         },
         headers=ESPN_HDRS,
-        timeout=20,
+        timeout=25,
     )
-    s.raise_for_status()
-    sdata = s.json()
+    r.raise_for_status()
+    return r.json()
 
-    athletes_raw = sdata.get("athletes", [])
-    if not athletes_raw:
-        raise RuntimeError(
-            f"ESPN returned no athletes. Top-level keys: {list(sdata.keys())}. "
-            f"Sample response: {str(sdata)[:500]}"
-        )
 
-    # ── 2. Build flat header list from top-level categories ───────────────────
+def _parse_espn_response(data):
+    """Return (records list, athletes_raw, flat_headers) from an ESPN stats response."""
+    athletes_raw = data.get("athletes", [])
+
+    # Build flat header list from top-level categories
     flat_headers = []
-    for cat in sdata.get("categories", []):
-        for stat in cat.get("stats", []):
-            flat_headers.append(stat.get("name", ""))
+    for cat in (data.get("categories") or []):
+        if isinstance(cat, dict):
+            for stat in cat.get("stats", []):
+                flat_headers.append(stat.get("name", ""))
 
-    # ── 3. Parse each athlete entry ────────────────────────────────────────────
     records = []
     for entry in athletes_raw:
-        ath   = entry.get("athlete", {})
-        stats = entry.get("statistics", [])
+        ath = entry.get("athlete", {}) if isinstance(entry.get("athlete"), dict) else {}
+        if "$ref" in ath:
+            # HATEOAS ref — skip; we can't resolve without extra requests
+            continue
 
-        stat_dict = {}
-        if isinstance(stats, list):
-            if flat_headers:
-                # Parallel-array format: stats[i] maps to flat_headers[i]
-                for i, val in enumerate(stats):
-                    if i < len(flat_headers) and flat_headers[i]:
-                        stat_dict[flat_headers[i]] = safe_float(val)
-            else:
-                # Per-athlete list of category objects:
-                # [{"name": "offensive", "stats": [{"name": "avgPoints", "value": 30.4}, ...]}, ...]
-                for item in stats:
-                    if isinstance(item, dict):
-                        for st in item.get("stats", []):
-                            name = st.get("name", "")
-                            val  = st.get("value") if st.get("value") is not None \
-                                   else st.get("displayValue")
-                            if name:
-                                stat_dict[name] = safe_float(val)
-        elif isinstance(stats, dict):
-            # Nested splits.categories format
-            for cat in stats.get("splits", {}).get("categories", []):
-                for st in cat.get("stats", []):
-                    stat_dict[st["name"]] = safe_float(st.get("value"))
-
-        espn_id  = str(ath.get("id", ""))
-        headshot = ath.get("headshot", {})
-        hs_url   = (
-            headshot.get("href")
-            if isinstance(headshot, dict)
-            else f"https://a.espncdn.com/i/headshots/nba/players/full/{espn_id}.png"
-        )
-
-        # ESPN sometimes returns team as a $ref URL instead of an object with id.
-        # e.g. {"$ref": "http://sports.core.api.espn.com/.../teams/15?..."}
-        team_obj = ath.get("team", {})
-        if isinstance(team_obj, dict) and "$ref" in team_obj:
-            m = re.search(r"/teams/(\d+)", team_obj["$ref"])
-            team_id = m.group(1) if m else ""
-        else:
-            team_id = str(team_obj.get("id", "")) if isinstance(team_obj, dict) else ""
+        stat_dict = _extract_stats(entry, flat_headers)
+        espn_id   = str(ath.get("id", ""))
+        headshot  = ath.get("headshot", {})
+        hs_url    = (headshot.get("href") if isinstance(headshot, dict)
+                     else f"https://a.espncdn.com/i/headshots/nba/players/full/{espn_id}.png")
+        pos_obj   = ath.get("position", {})
+        position  = pos_obj.get("abbreviation", "") if isinstance(pos_obj, dict) else ""
 
         records.append({
             "espn_id":  espn_id,
             "name":     ath.get("displayName", ""),
             "jersey":   ath.get("jersey", ""),
-            "position": ath.get("position", {}).get("abbreviation", ""),
-            "team_id":  team_id,
+            "position": position,
+            "team_id":  _extract_team_id(ath),
             "headshot": hs_url,
             **stat_dict,
         })
 
-    if not records:
-        sample_entry = athletes_raw[0] if athletes_raw else {}
-        sample_stats = sample_entry.get("statistics", "MISSING")
+    return records, athletes_raw, flat_headers
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_data():
+    # ── 1. Fetch general stats (pts, reb, ast, stl, blk, tov, min, gp) ────────
+    gen_data = _fetch_espn("general", "avgPoints")
+
+    athletes_raw = gen_data.get("athletes", [])
+    if not athletes_raw:
         raise RuntimeError(
-            f"Parsed 0 records from {len(athletes_raw)} athletes. "
-            f"flat_headers (first 10): {flat_headers[:10]}. "
-            f"First entry keys: {list(sample_entry.keys())}. "
-            f"First entry 'statistics' type/value: {type(sample_stats).__name__} = {str(sample_stats)[:300]}."
+            f"ESPN returned no athletes. Keys: {list(gen_data.keys())}. "
+            f"Sample: {str(gen_data)[:400]}"
+        )
+
+    records, athletes_raw, flat_headers = _parse_espn_response(gen_data)
+
+    # ── 2. Fetch offensive stats (fga, fg3a, fta, oreb) and merge ─────────────
+    try:
+        off_data = _fetch_espn("offensive", "avgPoints")
+        off_records, _, off_headers = _parse_espn_response(off_data)
+        off_map = {r["espn_id"]: r for r in off_records if r["espn_id"]}
+        for rec in records:
+            if rec["espn_id"] in off_map:
+                for k, v in off_map[rec["espn_id"]].items():
+                    if k not in {"espn_id", "name", "jersey", "position", "team_id", "headshot"}:
+                        rec.setdefault(k, v)
+    except Exception:
+        off_headers = []
+
+    # ── 3. Build DataFrame ─────────────────────────────────────────────────────
+    if not records:
+        first = athletes_raw[0] if athletes_raw else {}
+        first_keys = list(first.keys())
+        first_ath  = str(first.get("athlete", {}))[:400]
+        first_stats = str(first.get("statistics", "ABSENT"))[:300]
+        raise RuntimeError(
+            f"Parsed 0 valid records from {len(athletes_raw)} athletes. "
+            f"Entry keys: {first_keys}. athlete: {first_ath}. "
+            f"statistics: {first_stats}. flat_headers: {flat_headers[:10]}."
         )
 
     pool = pd.DataFrame(records)
 
-    # Capture stat column names BEFORE any mapping so we can debug mismatches
     raw_stat_cols = [c for c in pool.columns
                      if c not in {"espn_id","name","jersey","position","team_id","headshot"}]
 
@@ -241,16 +294,16 @@ def load_data():
     )
 
     if bucks_pool.empty:
-        mapped     = [k for k in STAT_CANDIDATES if pool[k].notna().any()]
-        tids       = pool["team_id"].value_counts().head(10).to_dict()
-        sample_raw = str(athletes_raw[0].get("statistics", ""))[:600] if athletes_raw else ""
+        mapped = [k for k in STAT_CANDIDATES if pool[k].notna().any()]
+        tids   = pool["team_id"].value_counts().head(10).to_dict()
+        first  = athletes_raw[0] if athletes_raw else {}
         raise RuntimeError(
-            f"Pool has {len(pool)} players but none with team_id='{BUCKS_ESPN_ID}'. "
-            f"Sample team_ids: {tids}. "
-            f"Mapped stats: {mapped}. "
-            f"Raw ESPN stat cols (first 20): {raw_stat_cols[:20]}. "
-            f"flat_headers (first 20): {flat_headers[:20]}. "
-            f"First athlete raw statistics: {sample_raw}."
+            f"Pool={len(pool)} players, none with team_id='{BUCKS_ESPN_ID}'. "
+            f"team_ids: {tids}. mapped: {mapped}. "
+            f"raw_cols: {raw_stat_cols[:15]}. flat_headers: {flat_headers[:15]}. "
+            f"entry_keys: {list(first.keys())}. "
+            f"ath_keys: {list(first.get('athlete', {}).keys()) if isinstance(first.get('athlete'), dict) else 'not-dict'}. "
+            f"statistics_val: {str(first.get('statistics', 'ABSENT'))[:300]}."
         )
 
     return pool, bucks_pool
