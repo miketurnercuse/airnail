@@ -173,15 +173,13 @@ def _extract_team_id(ath):
     return ""
 
 
-def _fetch_espn(category, sort_col, limit=500):
+def _fetch_espn(limit=500):
     r = requests.get(
         ESPN_STATS_URL,
         params={
             "region": "us", "lang": "en", "contentorigin": "espn",
             "isqualified": "true",
             "limit": str(limit), "season": SEASON, "seasontype": "2",
-            "category": category,
-            "sort": f"{sort_col}:desc",
         },
         headers=ESPN_HDRS,
         timeout=25,
@@ -194,7 +192,7 @@ def _parse_espn_response(data):
     """Return (records list, athletes_raw, flat_headers) from an ESPN stats response."""
     athletes_raw = data.get("athletes", [])
 
-    # Build flat header list from top-level categories
+    # Build flat header list from top-level categories (parallel-array format)
     flat_headers = []
     for cat in (data.get("categories") or []):
         if isinstance(cat, dict):
@@ -202,23 +200,38 @@ def _parse_espn_response(data):
                 flat_headers.append(stat.get("name", ""))
 
     records = []
-    for entry in athletes_raw:
-        ath = entry.get("athlete", {}) if isinstance(entry.get("athlete"), dict) else {}
-        if "$ref" in ath:
-            # HATEOAS ref — skip; we can't resolve without extra requests
+    for i, entry in enumerate(athletes_raw):
+        ath = entry.get("athlete", {})
+        # Handle both inline objects and $ref-with-inline-fields (ESPN sometimes
+        # returns {"$ref": "...", "id": "...", "displayName": "..."})
+        if not isinstance(ath, dict):
             continue
-
+        # If pure $ref with no inline data we can still try to extract stats
         stat_dict = _extract_stats(entry, flat_headers)
-        espn_id   = str(ath.get("id", ""))
-        headshot  = ath.get("headshot", {})
-        hs_url    = (headshot.get("href") if isinstance(headshot, dict)
-                     else f"https://a.espncdn.com/i/headshots/nba/players/full/{espn_id}.png")
-        pos_obj   = ath.get("position", {})
-        position  = pos_obj.get("abbreviation", "") if isinstance(pos_obj, dict) else ""
+
+        # ESPN parallel-array responses store stats indexed to athletes array
+        # at the top level under sdata["statistics"] — check that too
+        if not stat_dict:
+            top_stats = data.get("statistics")
+            if isinstance(top_stats, list) and i < len(top_stats):
+                row = top_stats[i]
+                if isinstance(row, list) and flat_headers:
+                    for j, val in enumerate(row):
+                        if j < len(flat_headers) and flat_headers[j]:
+                            stat_dict[flat_headers[j]] = safe_float(val)
+                elif isinstance(row, dict):
+                    stat_dict = _extract_stats({"statistics": row}, flat_headers)
+
+        espn_id  = str(ath.get("id", ""))
+        headshot = ath.get("headshot", {})
+        hs_url   = (headshot.get("href") if isinstance(headshot, dict)
+                    else f"https://a.espncdn.com/i/headshots/nba/players/full/{espn_id}.png")
+        pos_obj  = ath.get("position", {})
+        position = pos_obj.get("abbreviation", "") if isinstance(pos_obj, dict) else ""
 
         records.append({
             "espn_id":  espn_id,
-            "name":     ath.get("displayName", ""),
+            "name":     ath.get("displayName", ath.get("shortName", "")),
             "jersey":   ath.get("jersey", ""),
             "position": position,
             "team_id":  _extract_team_id(ath),
@@ -231,41 +244,30 @@ def _parse_espn_response(data):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
-    # ── 1. Fetch general stats (pts, reb, ast, stl, blk, tov, min, gp) ────────
-    gen_data = _fetch_espn("general", "avgPoints")
+    # ── 1. Fetch ESPN stats ────────────────────────────────────────────────────
+    sdata = _fetch_espn()
 
-    athletes_raw = gen_data.get("athletes", [])
+    athletes_raw = sdata.get("athletes", [])
     if not athletes_raw:
         raise RuntimeError(
-            f"ESPN returned no athletes. Keys: {list(gen_data.keys())}. "
-            f"Sample: {str(gen_data)[:400]}"
+            f"ESPN returned no athletes. "
+            f"Top-level keys: {list(sdata.keys())}. "
+            f"Full response (first 1500 chars): {str(sdata)[:1500]}"
         )
 
-    records, athletes_raw, flat_headers = _parse_espn_response(gen_data)
+    records, athletes_raw, flat_headers = _parse_espn_response(sdata)
 
-    # ── 2. Fetch offensive stats (fga, fg3a, fta, oreb) and merge ─────────────
-    try:
-        off_data = _fetch_espn("offensive", "avgPoints")
-        off_records, _, off_headers = _parse_espn_response(off_data)
-        off_map = {r["espn_id"]: r for r in off_records if r["espn_id"]}
-        for rec in records:
-            if rec["espn_id"] in off_map:
-                for k, v in off_map[rec["espn_id"]].items():
-                    if k not in {"espn_id", "name", "jersey", "position", "team_id", "headshot"}:
-                        rec.setdefault(k, v)
-    except Exception:
-        off_headers = []
-
-    # ── 3. Build DataFrame ─────────────────────────────────────────────────────
+    # ── 2. Build DataFrame ─────────────────────────────────────────────────────
     if not records:
         first = athletes_raw[0] if athletes_raw else {}
-        first_keys = list(first.keys())
-        first_ath  = str(first.get("athlete", {}))[:400]
-        first_stats = str(first.get("statistics", "ABSENT"))[:300]
         raise RuntimeError(
-            f"Parsed 0 valid records from {len(athletes_raw)} athletes. "
-            f"Entry keys: {first_keys}. athlete: {first_ath}. "
-            f"statistics: {first_stats}. flat_headers: {flat_headers[:10]}."
+            f"0 valid records from {len(athletes_raw)} athletes. "
+            f"sdata keys: {list(sdata.keys())}. "
+            f"entry keys: {list(first.keys())}. "
+            f"athlete obj: {str(first.get('athlete', 'ABSENT'))[:500]}. "
+            f"statistics: {str(first.get('statistics', 'ABSENT'))[:300]}. "
+            f"flat_headers: {flat_headers[:10]}. "
+            f"Full first entry: {str(first)[:800]}."
         )
 
     pool = pd.DataFrame(records)
@@ -273,7 +275,7 @@ def load_data():
     raw_stat_cols = [c for c in pool.columns
                      if c not in {"espn_id","name","jersey","position","team_id","headshot"}]
 
-    # ── 4. Map ESPN stat names → internal keys ─────────────────────────────────
+    # ── 3. Map ESPN stat names → internal keys ─────────────────────────────────
     available = set(pool.columns)
     for key, candidates in STAT_CANDIDATES.items():
         src = next((c for c in candidates if c in available), None)
@@ -286,7 +288,7 @@ def load_data():
     for col in STAT_COLS:
         pool[f"{col}_p36"] = (pool[col] / pool["min"].replace(0, np.nan) * 36).round(1)
 
-    # ── 5. Bucks subset ────────────────────────────────────────────────────────
+    # ── 4. Bucks subset ────────────────────────────────────────────────────────
     bucks_pool = (
         pool[pool["team_id"] == BUCKS_ESPN_ID]
         .sort_values("name")
@@ -297,13 +299,16 @@ def load_data():
         mapped = [k for k in STAT_CANDIDATES if pool[k].notna().any()]
         tids   = pool["team_id"].value_counts().head(10).to_dict()
         first  = athletes_raw[0] if athletes_raw else {}
+        ath0   = first.get("athlete", {}) if isinstance(first.get("athlete"), dict) else {}
         raise RuntimeError(
             f"Pool={len(pool)} players, none with team_id='{BUCKS_ESPN_ID}'. "
             f"team_ids: {tids}. mapped: {mapped}. "
             f"raw_cols: {raw_stat_cols[:15]}. flat_headers: {flat_headers[:15]}. "
+            f"sdata_keys: {list(sdata.keys())}. "
             f"entry_keys: {list(first.keys())}. "
-            f"ath_keys: {list(first.get('athlete', {}).keys()) if isinstance(first.get('athlete'), dict) else 'not-dict'}. "
-            f"statistics_val: {str(first.get('statistics', 'ABSENT'))[:300]}."
+            f"ath_keys: {list(ath0.keys())}. "
+            f"statistics_val: {str(first.get('statistics', 'ABSENT'))[:400]}. "
+            f"Full first entry: {str(first)[:1000]}."
         )
 
     return pool, bucks_pool
