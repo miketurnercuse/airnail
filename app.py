@@ -154,13 +154,25 @@ def load_data():
         stats = entry.get("statistics", [])
 
         stat_dict = {}
-        if isinstance(stats, list) and flat_headers:
-            # Flat parallel array (most common ESPN format)
-            for i, val in enumerate(stats):
-                if i < len(flat_headers) and flat_headers[i]:
-                    stat_dict[flat_headers[i]] = safe_float(val)
+        if isinstance(stats, list):
+            if flat_headers:
+                # Parallel-array format: stats[i] maps to flat_headers[i]
+                for i, val in enumerate(stats):
+                    if i < len(flat_headers) and flat_headers[i]:
+                        stat_dict[flat_headers[i]] = safe_float(val)
+            else:
+                # Per-athlete list of category objects:
+                # [{"name": "offensive", "stats": [{"name": "avgPoints", "value": 30.4}, ...]}, ...]
+                for item in stats:
+                    if isinstance(item, dict):
+                        for st in item.get("stats", []):
+                            name = st.get("name", "")
+                            val  = st.get("value") if st.get("value") is not None \
+                                   else st.get("displayValue")
+                            if name:
+                                stat_dict[name] = safe_float(val)
         elif isinstance(stats, dict):
-            # Nested splits.categories format (fallback)
+            # Nested splits.categories format
             for cat in stats.get("splits", {}).get("categories", []):
                 for st in cat.get("stats", []):
                     stat_dict[st["name"]] = safe_float(st.get("value"))
@@ -229,14 +241,16 @@ def load_data():
     )
 
     if bucks_pool.empty:
-        mapped  = [k for k in STAT_CANDIDATES if pool[k].notna().any()]
-        tids    = pool["team_id"].value_counts().head(10).to_dict()
+        mapped     = [k for k in STAT_CANDIDATES if pool[k].notna().any()]
+        tids       = pool["team_id"].value_counts().head(10).to_dict()
+        sample_raw = str(athletes_raw[0].get("statistics", ""))[:600] if athletes_raw else ""
         raise RuntimeError(
             f"Pool has {len(pool)} players but none with team_id='{BUCKS_ESPN_ID}'. "
             f"Sample team_ids: {tids}. "
             f"Mapped stats: {mapped}. "
-            f"Raw ESPN stat columns (first 20): {raw_stat_cols[:20]}. "
-            f"flat_headers (first 20): {flat_headers[:20]}."
+            f"Raw ESPN stat cols (first 20): {raw_stat_cols[:20]}. "
+            f"flat_headers (first 20): {flat_headers[:20]}. "
+            f"First athlete raw statistics: {sample_raw}."
         )
 
     return pool, bucks_pool
