@@ -118,53 +118,23 @@ def safe_float(val):
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
-def _extract_stats(entry, flat_headers):
-    """Pull stat name→value dict from an ESPN athlete entry using all known formats."""
-    ath   = entry.get("athlete", {}) if isinstance(entry.get("athlete"), dict) else {}
-    # ESPN puts statistics under several possible keys depending on endpoint/version
-    raw   = (entry.get("statistics")
-             or entry.get("stats")
-             or entry.get("splits")
-             or ath.get("statistics")
-             or ath.get("stats")
-             or [])
-
-    stat_dict = {}
-
-    if isinstance(raw, list):
-        if flat_headers and raw and not isinstance(raw[0], dict):
-            # Parallel-array format: raw[i] corresponds to flat_headers[i]
-            for i, val in enumerate(raw):
-                if i < len(flat_headers) and flat_headers[i]:
-                    stat_dict[flat_headers[i]] = safe_float(val)
-        else:
-            for item in raw:
-                if not isinstance(item, dict):
-                    continue
-                if "name" in item and ("value" in item or "displayValue" in item):
-                    # Direct stat object: {"name": "avgPoints", "value": 30.4}
-                    name = item["name"]
-                    val  = item.get("value") if item.get("value") is not None else item.get("displayValue")
-                    stat_dict[name] = safe_float(val)
-                else:
-                    # Category object: {"name": "offensive", "stats": [...]}
-                    for st in item.get("stats", []):
-                        name = st.get("name", "")
-                        val  = st.get("value") if st.get("value") is not None else st.get("displayValue")
-                        if name:
-                            stat_dict[name] = safe_float(val)
-
-    elif isinstance(raw, dict) and "$ref" not in raw:
-        # Nested splits.categories format
-        for cat in raw.get("splits", {}).get("categories", []):
-            for st in cat.get("stats", []):
-                stat_dict[st["name"]] = safe_float(st.get("value"))
-
-    return stat_dict
+def _stat_val(st):
+    """Extract numeric value from an ESPN stat dict."""
+    v = st.get("value")
+    if v is None:
+        v = st.get("displayValue")
+    return safe_float(v)
 
 
 def _extract_team_id(ath):
-    team_obj = ath.get("team", {}) if isinstance(ath, dict) else {}
+    if not isinstance(ath, dict):
+        return ""
+    # ESPN byathlete format: teamId sits directly on the athlete object
+    tid = ath.get("teamId")
+    if tid is not None:
+        return str(tid)
+    # Older formats: team sub-object (possibly a $ref URL)
+    team_obj = ath.get("team", {})
     if isinstance(team_obj, dict):
         if "$ref" in team_obj:
             m = re.search(r"/teams/(\d+)", team_obj["$ref"])
@@ -189,38 +159,58 @@ def _fetch_espn(limit=500):
 
 
 def _parse_espn_response(data):
-    """Return (records list, athletes_raw, flat_headers) from an ESPN stats response."""
+    """Return (records list, athletes_raw) from an ESPN byathlete response.
+
+    ESPN byathlete structure (confirmed 2024-25):
+      sdata["categories"]   — list of category defs, each with "statistics" (not "stats")
+                              listing {"name": "avgPoints", ...} headers
+      entry["athlete"]      — inline athlete object; teamId is a direct field
+      entry["categories"]   — list of category objects each with "statistics" list;
+                              values are either flat numbers (parallel to category defs)
+                              or name-value dicts
+    """
     athletes_raw = data.get("athletes", [])
 
-    # Build flat header list from top-level categories (parallel-array format)
-    flat_headers = []
-    for cat in (data.get("categories") or []):
+    # Build per-category header lists from top-level category definitions.
+    # ESPN uses "statistics" as the sub-key inside each category, not "stats".
+    top_cats = data.get("categories") or []
+    cat_headers = []   # cat_headers[i] = list of stat names for category i
+    for cat in top_cats:
         if isinstance(cat, dict):
-            for stat in cat.get("stats", []):
-                flat_headers.append(stat.get("name", ""))
+            defs = cat.get("statistics") or cat.get("stats") or []
+            names = [s.get("name", "") if isinstance(s, dict) else "" for s in defs]
+            cat_headers.append(names)
+        else:
+            cat_headers.append([])
 
     records = []
-    for i, entry in enumerate(athletes_raw):
+    for entry in athletes_raw:
         ath = entry.get("athlete", {})
-        # Handle both inline objects and $ref-with-inline-fields (ESPN sometimes
-        # returns {"$ref": "...", "id": "...", "displayName": "..."})
         if not isinstance(ath, dict):
             continue
-        # If pure $ref with no inline data we can still try to extract stats
-        stat_dict = _extract_stats(entry, flat_headers)
 
-        # ESPN parallel-array responses store stats indexed to athletes array
-        # at the top level under sdata["statistics"] — check that too
-        if not stat_dict:
-            top_stats = data.get("statistics")
-            if isinstance(top_stats, list) and i < len(top_stats):
-                row = top_stats[i]
-                if isinstance(row, list) and flat_headers:
-                    for j, val in enumerate(row):
-                        if j < len(flat_headers) and flat_headers[j]:
-                            stat_dict[flat_headers[j]] = safe_float(val)
-                elif isinstance(row, dict):
-                    stat_dict = _extract_stats({"statistics": row}, flat_headers)
+        stat_dict = {}
+
+        # Primary: entry["categories"] contains per-athlete stat values
+        entry_cats = entry.get("categories") or []
+        for ci, ecat in enumerate(entry_cats):
+            if not isinstance(ecat, dict):
+                continue
+            vals = ecat.get("statistics") or ecat.get("stats") or []
+            if not vals:
+                continue
+            if isinstance(vals[0], dict):
+                # Named format: [{"name": "avgPoints", "value": 30.4}, ...]
+                for st in vals:
+                    name = st.get("name", "")
+                    if name:
+                        stat_dict[name] = _stat_val(st)
+            else:
+                # Flat numeric array, parallel to cat_headers[ci]
+                names = cat_headers[ci] if ci < len(cat_headers) else []
+                for j, val in enumerate(vals):
+                    if j < len(names) and names[j]:
+                        stat_dict[names[j]] = safe_float(val)
 
         espn_id  = str(ath.get("id", ""))
         headshot = ath.get("headshot", {})
@@ -239,7 +229,7 @@ def _parse_espn_response(data):
             **stat_dict,
         })
 
-    return records, athletes_raw, flat_headers
+    return records, athletes_raw
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -255,7 +245,7 @@ def load_data():
             f"Full response (first 1500 chars): {str(sdata)[:1500]}"
         )
 
-    records, athletes_raw, flat_headers = _parse_espn_response(sdata)
+    records, athletes_raw = _parse_espn_response(sdata)
 
     # ── 2. Build DataFrame ─────────────────────────────────────────────────────
     if not records:
@@ -265,8 +255,7 @@ def load_data():
             f"sdata keys: {list(sdata.keys())}. "
             f"entry keys: {list(first.keys())}. "
             f"athlete obj: {str(first.get('athlete', 'ABSENT'))[:500]}. "
-            f"statistics: {str(first.get('statistics', 'ABSENT'))[:300]}. "
-            f"flat_headers: {flat_headers[:10]}. "
+            f"categories: {str(first.get('categories', 'ABSENT'))[:400]}. "
             f"Full first entry: {str(first)[:800]}."
         )
 
@@ -303,11 +292,11 @@ def load_data():
         raise RuntimeError(
             f"Pool={len(pool)} players, none with team_id='{BUCKS_ESPN_ID}'. "
             f"team_ids: {tids}. mapped: {mapped}. "
-            f"raw_cols: {raw_stat_cols[:15]}. flat_headers: {flat_headers[:15]}. "
+            f"raw_cols: {raw_stat_cols[:15]}. "
             f"sdata_keys: {list(sdata.keys())}. "
             f"entry_keys: {list(first.keys())}. "
             f"ath_keys: {list(ath0.keys())}. "
-            f"statistics_val: {str(first.get('statistics', 'ABSENT'))[:400]}. "
+            f"categories_val: {str(first.get('categories', 'ABSENT'))[:400]}. "
             f"Full first entry: {str(first)[:1000]}."
         )
 
